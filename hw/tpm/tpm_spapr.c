@@ -85,6 +85,8 @@ typedef struct {
     TPMVersion be_tpm_version;
 
     size_t be_buffer_size;
+
+    bool deliver_response; /* whether to deliver response after migration */
 } SPAPRvTPMState;
 
 static void tpm_spapr_show_buffer(const unsigned char *buffer,
@@ -237,9 +239,8 @@ static int tpm_spapr_do_crq(struct VIOsPAPRDevice *dev, uint8_t *crq_data)
     return H_SUCCESS;
 }
 
-static void tpm_spapr_request_completed(TPMIf *ti, int ret)
+static void tpm_spapr_request_completed(SPAPRvTPMState *s, int ret)
 {
-    SPAPRvTPMState *s = VIO_SPAPR_VTPM(ti);
     TPMSpaprCRQ *crq = &s->crq;
     uint32_t len;
     int rc;
@@ -270,6 +271,13 @@ static void tpm_spapr_request_completed(TPMIf *ti, int ret)
     if (rc) {
         error_report("%s: Error sending response\n", __func__);
     }
+}
+
+static void tpm_spapr_request_completed_tpmif(TPMIf *ti, int ret)
+{
+    SPAPRvTPMState *s = VIO_SPAPR_VTPM(ti);
+
+    tpm_spapr_request_completed(s, ret);
 }
 
 static int tpm_spapr_do_startup_tpm(SPAPRvTPMState *s, size_t buffersize)
@@ -304,9 +312,58 @@ static enum TPMVersion tpm_spapr_get_version(TPMIf *ti)
     return tpm_backend_get_tpm_version(s->be_driver);
 }
 
+/* persistent state handling */
+
+static int tpm_spapr_pre_save(void *opaque)
+{
+    SPAPRvTPMState *s = opaque;
+
+    s->deliver_response = tpm_backend_finish_sync(s->be_driver);
+    /*
+     * we cannot deliver the results to the VM (in state
+     * SPAPR_VTPM_STATE_EXECUTION) since DMA would touch VM memory
+     */
+
+    return 0;
+}
+
+static int tpm_spapr_post_load(void *opaque,
+                               int version_id __attribute__((unused)))
+{
+    SPAPRvTPMState *s = opaque;
+
+    if (s->deliver_response) {
+        /* deliver the results to the VM via DMA */
+        tpm_spapr_request_completed(s, 0);
+    }
+
+    return 0;
+}
+
 static const VMStateDescription vmstate_spapr_vtpm = {
-    .name = "tpm_spapr",
-    .unmigratable = 1,
+    .name = "tpm-spapr",
+    .version_id = 1,
+    .minimum_version_id = 0,
+    .minimum_version_id_old = 0,
+    .pre_save = tpm_spapr_pre_save,
+    .post_load = tpm_spapr_post_load,
+    .fields = (VMStateField[]) {
+        /* Sanity check */
+        VMSTATE_UINT32_EQUAL(vdev.reg, SPAPRvTPMState, NULL),
+        VMSTATE_UINT32_EQUAL(vdev.irq, SPAPRvTPMState, NULL),
+
+        /* General VIO device state */
+        VMSTATE_UINT64(vdev.signal_state, SPAPRvTPMState),
+        VMSTATE_UINT64(vdev.crq.qladdr, SPAPRvTPMState),
+        VMSTATE_UINT32(vdev.crq.qsize, SPAPRvTPMState),
+        VMSTATE_UINT32(vdev.crq.qnext, SPAPRvTPMState),
+
+        VMSTATE_BUFFER(crq.raw, SPAPRvTPMState),
+        VMSTATE_UINT8(state, SPAPRvTPMState),
+        VMSTATE_BUFFER(buffer, SPAPRvTPMState),
+        VMSTATE_BOOL(deliver_response, SPAPRvTPMState),
+        VMSTATE_END_OF_LIST(),
+    }
 };
 
 static Property tpm_spapr_properties[] = {
@@ -351,7 +408,7 @@ static void tpm_spapr_class_init(ObjectClass *klass, void *data)
 
     tc->model = TPM_MODEL_TPM_SPAPR;
     tc->get_version = tpm_spapr_get_version;
-    tc->request_completed = tpm_spapr_request_completed;
+    tc->request_completed = tpm_spapr_request_completed_tpmif;
 }
 
 static const TypeInfo tpm_spapr_info = {
