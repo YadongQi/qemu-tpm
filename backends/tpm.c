@@ -48,11 +48,16 @@ static int tpm_backend_worker_thread(gpointer data)
     return 0;
 }
 
-void tpm_backend_finish_sync(TPMBackend *s)
+bool tpm_backend_finish_sync(TPMBackend *s)
 {
+    bool ret = false;
+
     while (s->cmd) {
         aio_poll(qemu_get_aio_context(), true);
+        ret = true;
     }
+
+    return ret;
 }
 
 enum TpmType tpm_backend_get_type(TPMBackend *s)
